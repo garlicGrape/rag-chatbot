@@ -1,89 +1,94 @@
 Project context for Claude Code. Read this before making changes.
 What this is
-A retrieval-augmented chatbot over my NYU Stern MSBAi coursework. It ingests lecture slides, notes, problem sets, and readings, embeds them locally, and answers questions with citations back to the source file and page/slide.
-Goal: a study/reference assistant that runs entirely on my machine. No course material leaves the laptop.
+A retrieval-augmented chatbot over my NYU Stern MSBAi coursework, deployed online and embedded into my portfolio site (sanchitk.dev). Visitors (and I) can ask questions about the material and get answers with citations back to the source file and page/slide.
+Two distinct phases — keep them separate:
+
+* Ingestion (offline, run by me): parse coursework files, chunk, embed, and upsert into the vector store. Runs on my machine or in CI, not at request time.
+* Serving (runtime, public): a Cloudflare Worker answers queries from the React frontend. This is internet-facing — treat it accordingly.
 Stack
+Cloudflare-native backend so it sits alongside the existing site, with Claude for answer quality:
 
-* Python 3.11+, deps managed with `uv` (fall back to `pip` only if asked).
-* FastAPI backend exposing `/chat`, `/ingest`, `/health`.
-* Ollama for both generation and embeddings, running locally.
-   * Generation: `qwen2.5:7b` (default) — fits in 8 GB VRAM.
-   * Embeddings: `nomic-embed-text`.
-* ChromaDB as the vector store, persisted to `./data/chroma/`.
-* Optional frontend: Vite + React (`/frontend`), talks to the API over HTTP.
-* Docker Compose wires Ollama + the API together for reproducible runs.
-If a change would swap any of these, ask first — don't silently introduce a new vector store, embedding model, or framework.
-Hardware constraints
-This runs on an RTX 5060 laptop: 8 GB VRAM, 32 GB system RAM. This is a hard limit, not a suggestion.
-
-* Don't propose models above ~7B at q4 for generation, or anything that won't fit alongside the embedding model.
-* Keep batch sizes for embedding modest; prefer streaming ingestion over loading every document into memory at once.
-* If a feature needs a bigger model, flag the VRAM cost rather than assuming a cloud fallback.
+* Frontend: existing Vite + React site (`garlicGrape/cloudflareSite`), deployed on Cloudflare Pages. Adds a chat widget that calls the Worker API.
+* API: Cloudflare Worker (`/worker`), TypeScript, managed with Wrangler. Routes: `POST /chat`, `GET /health`.
+* Vector store: Cloudflare Vectorize.
+* Embeddings: Workers AI `@cf/baai/bge-base-en-v1.5` (768-dim). The ingestion script and the query path MUST use the same model — dimensions have to match.
+* Generation: Anthropic API (Claude) called from the Worker, streamed back to the frontend.
+* Raw files / metadata: Cloudflare R2 for source files if needed for citation links (private bucket, not public).
+If a change would swap any of these (different vector DB, embedding model, or generation provider), ask first. Don't silently introduce a new vendor.
+Alternative I considered: doing generation with Workers AI too, for a fully on-Cloudflare stack with no external API key. Defaulting to Claude for answer quality. Flag the tradeoff if relevant, don't just switch.
 Repo layout
 
 ```
 .
-├── app/
-│   ├── main.py            # FastAPI app + routes
-│   ├── ingest.py          # loaders, chunking, embedding, upsert
-│   ├── retrieve.py        # query -> top-k chunks
-│   ├── chat.py            # prompt assembly, Ollama call, citation formatting
-│   ├── loaders/           # per-filetype extractors (pdf, pptx, docx, md)
-│   └── config.py          # all tunables (model names, chunk size, top_k)
-├── data/
-│   ├── source/            # raw MSBAi files (gitignored)
-│   └── chroma/            # persisted vector store (gitignored)
-├── frontend/              # Vite + React chat UI (optional)
-├── docker-compose.yml
-└── pyproject.toml
+├── worker/
+│   ├── src/
+│   │   ├── index.ts        # Worker entry, routing, CORS
+│   │   ├── chat.ts         # query embed -> Vectorize query -> prompt -> Claude
+│   │   ├── retrieve.ts     # Vectorize top-k + metadata assembly
+│   │   ├── prompt.ts       # system prompt + context formatting (single source)
+│   │   └── ratelimit.ts    # abuse / cost protection
+│   ├── wrangler.toml       # bindings: VECTORIZE, AI, R2, secrets
+│   └── package.json
+├── ingest/
+│   ├── ingest.ts           # CLI: load -> chunk -> embed -> upsert
+│   ├── loaders/            # per-filetype extractors (pdf, pptx, docx, md)
+│   └── config.ts           # chunk size, overlap, model names, top_k
+├── frontend/               # chat widget components (or in the main site repo)
+└── data/source/            # raw MSBAi files (gitignored, NEVER committed)
 
 ```
 
+Note: the frontend may live in the existing site repo rather than here — wire the widget into that codebase and point it at the deployed Worker URL.
 Common commands
 
 ```bash
-# Install deps
-uv sync
+# Worker
+cd worker
+npm install
+npx wrangler dev                      # local dev against remote bindings
+npx wrangler deploy                   # ship to Cloudflare
+npx wrangler secret put ANTHROPIC_API_KEY
 
-# Pull required models (one-time)
-ollama pull qwen2.5:7b
-ollama pull nomic-embed-text
+# Vectorize (one-time setup)
+npx wrangler vectorize create msbai-index --dimensions=768 --metric=cosine
 
-# Ingest everything in data/source/
-uv run python -m app.ingest --path data/source
-
-# Run the API (dev)
-uv run uvicorn app.main:app --reload --port 8000
-
-# Full stack via Docker
-docker compose up --build
-
-# Frontend dev server
-cd frontend && npm run dev
+# Ingestion (run after adding/changing source files)
+cd ingest
+npm install
+npm run ingest -- --path ../data/source
 
 ```
 
+Security & cost — this endpoint is public
+This is the part that matters most now that it's online.
+
+* Secrets: `ANTHROPIC_API_KEY` and any other keys are Wrangler secrets, never in the repo, `wrangler.toml`, or client code. The frontend never holds a key — it only talks to the Worker.
+* CORS: lock the Worker to `https://sanchitk.dev` (and `www`). No wildcard origins.
+* Rate limiting: required. A public `/chat` that calls a paid API is a cost and abuse risk. Per-IP limits via `ratelimit.ts`; cap request body size and reject oversized or malformed payloads early.
+* Cost awareness: every query now costs money (embedding + generation). Keep `top_k` and context size tight; don't stuff the whole retrieval set into the prompt. Flag changes that materially raise per-query cost.
+* No prompt injection footguns: retrieved chunks are data, not instructions. The system prompt must treat context as reference material only.
 RAG conventions
 
-* Chunking: ~800-token chunks with ~100-token overlap. Slides chunk per slide; PDFs/notes chunk by token window with overlap. Keep chunk size in `config.py`, never hardcode it across files.
-* Metadata: every chunk stores `source_file`, `page_or_slide`, `course`, and `chunk_index`. Retrieval and citations depend on these — don't drop them.
-* Citations are required: answers must point to the source file and page/slide. If retrieval returns nothing relevant, the model should say it doesn't have that in the materials rather than guessing.
-* Prompt: keep the system prompt in one place (`chat.py`). It instructs the model to answer only from retrieved context and to cite. Don't scatter prompt fragments.
-* top_k defaults to 5; it's a config value, not a magic number.
+* Chunking: ~800-token chunks, ~100-token overlap. Slides chunk per slide; PDFs/notes by token window. Chunk params live in `ingest/config.ts` only.
+* Metadata: every vector stores `source_file`, `page_or_slide`, `course`, and `chunk_index`. Citations and any R2 deep-links depend on these.
+* Citations required: answers point to source file + page/slide. If retrieval returns nothing relevant, the model says it isn't in the materials rather than guessing.
+* Prompt lives in one place (`worker/src/prompt.ts`). Don't scatter fragments.
+* top_k defaults to 5 — a config value, not a magic number.
+* Re-ingest on change: changing the embedding model or chunking invalidates the index. The Vectorize index must be rebuilt from scratch — old vectors won't match new query embeddings. Call this out whenever it applies.
 Data handling
 
-* Course files in `data/source/` and the `data/chroma/` store are gitignored and must stay that way. Never commit course material or embeddings.
-* Don't upload, fetch, or transmit any file under `data/` to an external service. Embeddings and generation are local via Ollama by design.
-* Treat the MSBAi content as private — no copying excerpts into commit messages, issues, or logs beyond what's needed to debug.
+* Course files in `data/source/` are gitignored and must stay that way. Never commit coursework or embeddings.
+* R2 buckets holding source files are private. Don't expose direct public URLs; serve citation content (if at all) through the Worker with access control.
+* Treat MSBAi content as private — no excerpts in commit messages, logs, or issues beyond what's needed to debug.
 Code style
 
-* Type hints on public functions; keep modules small and single-purpose.
-* Config over constants — new tunables go in `config.py`.
-* Prefer readable, plain code over clever abstractions; this is a personal project I'll come back to between classes.
-* Write functions so ingestion of a new filetype means adding one loader in `app/loaders/`, not editing the pipeline.
+* TypeScript throughout the Worker and ingestion; type the Vectorize and Workers AI bindings.
+* Config over constants — new tunables go in `config.ts` / `wrangler.toml`.
+* Adding a new source filetype = one loader in `ingest/loaders/`, not edits to the pipeline.
+* Prefer readable, plain code over clever abstractions; this is a personal project I'll revisit between classes.
 When working here
 
-* Run the API locally and hit `/health` before assuming Ollama is reachable.
-* After changing chunking or the embedding model, the store must be re-ingested from scratch — old vectors won't match new ones. Call this out when relevant.
-* Don't add telemetry, analytics, or any outbound network calls.
-* Keep dependencies lean; justify any new package.
+* Responses to the frontend should stream (Claude streaming -> Worker -> client).
+* Hit `/health` and confirm Vectorize/AI bindings resolve before debugging deeper.
+* Deploys go through `wrangler deploy`; keep `wrangler.toml` bindings in sync with what the code expects.
+* No telemetry or third-party analytics in the Worker. Logging stays minimal and free of coursework content.
