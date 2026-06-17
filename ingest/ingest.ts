@@ -11,25 +11,24 @@ import {
   EMBEDDING_MODEL,
 } from "./config.js";
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-function roughTokenize(text: string): string[] {
-  return text.split(/\s+/).filter(Boolean);
-}
+// ── text chunking ─────────────────────────────────────────────────────────────
 
 function chunkText(text: string): string[] {
-  const words = roughTokenize(text);
+  const words = text.split(/\s+/).filter(Boolean);
   const chunks: string[] = [];
   let start = 0;
 
   while (start < words.length) {
     const end = Math.min(start + CHUNK_SIZE_TOKENS, words.length);
     chunks.push(words.slice(start, end).join(" "));
+    if (end === words.length) break;
     start += CHUNK_SIZE_TOKENS - CHUNK_OVERLAP_TOKENS;
   }
 
   return chunks;
 }
+
+// ── Cloudflare API helpers ────────────────────────────────────────────────────
 
 async function embedTexts(texts: string[]): Promise<number[][]> {
   const url = `${WORKERS_AI_BASE}/${encodeURIComponent(EMBEDDING_MODEL)}`;
@@ -42,25 +41,20 @@ async function embedTexts(texts: string[]): Promise<number[][]> {
     body: JSON.stringify({ text: texts }),
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Workers AI embed failed: ${res.status} ${err}`);
-  }
+  if (!res.ok) throw new Error(`Workers AI embed failed: ${res.status} ${await res.text()}`);
 
   const json = (await res.json()) as { result: { data: number[][] } };
   return json.result.data;
 }
 
-async function upsertVectors(
-  vectors: Array<{
-    id: string;
-    values: number[];
-    metadata: Record<string, string | number>;
-  }>
-): Promise<void> {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${VECTORIZE_INDEX}/upsert`;
+interface Vector {
+  id: string;
+  values: number[];
+  metadata: Record<string, string | number>;
+}
 
-  // Vectorize REST upsert uses NDJSON
+async function upsertVectors(vectors: Vector[]): Promise<void> {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${VECTORIZE_INDEX}/upsert`;
   const ndjson = vectors.map((v) => JSON.stringify(v)).join("\n");
 
   const res = await fetch(url, {
@@ -72,13 +66,10 @@ async function upsertVectors(
     body: ndjson,
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Vectorize upsert failed: ${res.status} ${err}`);
-  }
+  if (!res.ok) throw new Error(`Vectorize upsert failed: ${res.status} ${await res.text()}`);
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
+// ── main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
   const args = process.argv.slice(2);
@@ -91,10 +82,11 @@ async function main() {
   }
 
   const sourceDir = args[pathIdx + 1]!;
-  const course = courseIdx !== -1 ? (args[courseIdx + 1] ?? path.basename(sourceDir)) : path.basename(sourceDir);
+  const course =
+    courseIdx !== -1 ? (args[courseIdx + 1] ?? path.basename(sourceDir)) : path.basename(sourceDir);
 
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
-    console.error("Set CF_ACCOUNT_ID and CF_API_TOKEN env vars");
+    console.error("Set CF_ACCOUNT_ID and CF_API_TOKEN env vars before running ingest.");
     process.exit(1);
   }
 
@@ -119,19 +111,25 @@ async function main() {
       continue;
     }
 
-    // Sub-chunk each loaded piece
-    const allChunks: Array<{ text: string; page_or_slide: number | string; source_file: string; course: string; chunk_index: number }> = [];
+    // Sub-chunk each page/slide into token-windowed pieces
+    interface FlatChunk {
+      text: string;
+      page_or_slide: number | string;
+      source_file: string;
+      course: string;
+      chunk_index: number;
+    }
+    const allChunks: FlatChunk[] = [];
     for (const rc of rawChunks) {
-      const subChunks = chunkText(rc.text);
-      subChunks.forEach((text, ci) => {
+      chunkText(rc.text).forEach((text, ci) => {
         allChunks.push({ ...rc, text, chunk_index: ci });
       });
     }
 
-    // Embed in batches of 50 (Workers AI limit)
+    // Embed in batches of 50 (Workers AI input limit)
     const EMBED_BATCH = 50;
     const UPSERT_BATCH = 100;
-    const vectors: Array<{ id: string; values: number[]; metadata: Record<string, string | number> }> = [];
+    const vectors: Vector[] = [];
 
     for (let i = 0; i < allChunks.length; i += EMBED_BATCH) {
       const batch = allChunks.slice(i, i + EMBED_BATCH);
@@ -145,14 +143,16 @@ async function main() {
             page_or_slide: c.page_or_slide,
             course: c.course,
             chunk_index: c.chunk_index,
-            text: c.text.slice(0, 1000), // Vectorize metadata cap
+            // Vectorize metadata cap ~10 KB per vector; truncate text to be safe
+            text: c.text.slice(0, 1000),
           },
         });
       });
-      process.stdout.write(`  Embedded ${Math.min(i + EMBED_BATCH, allChunks.length)}/${allChunks.length}\r`);
+      process.stdout.write(
+        `  Embedded ${Math.min(i + EMBED_BATCH, allChunks.length)}/${allChunks.length}\r`
+      );
     }
 
-    // Upsert in batches
     for (let i = 0; i < vectors.length; i += UPSERT_BATCH) {
       await upsertVectors(vectors.slice(i, i + UPSERT_BATCH));
     }

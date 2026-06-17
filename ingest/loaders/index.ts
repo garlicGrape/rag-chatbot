@@ -19,10 +19,10 @@ import { loadMd } from "./md.js";
 
 export function getLoader(ext: string): Loader | null {
   switch (ext.toLowerCase()) {
-    case ".pdf": return loadPdf;
+    case ".pdf":  return loadPdf;
     case ".pptx": return loadPptx;
     case ".docx": return loadDocx;
-    case ".md": return loadMd;
-    default: return null;
+    case ".md":   return loadMd;
+    default:      return null;
   }
 }

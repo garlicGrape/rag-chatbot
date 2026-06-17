@@ -12,7 +12,10 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 function corsHeaders(origin: string | null): Record<string, string> {
-  const allowed = origin && ALLOWED_ORIGINS.has(origin) ? origin : ALLOWED_ORIGINS.values().next().value!;
+  const allowed =
+    origin && ALLOWED_ORIGINS.has(origin)
+      ? origin
+      : ALLOWED_ORIGINS.values().next().value!;
   return {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",

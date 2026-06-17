@@ -10,9 +10,9 @@ export interface Chunk {
 }
 
 const TOP_K = 5;
+const MIN_SCORE = 0.35;
 
 export async function retrieveChunks(query: string, env: Env): Promise<Chunk[]> {
-  // Embed the query using the same model as ingestion
   const embedResult = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
     text: [query],
   });
@@ -26,10 +26,10 @@ export async function retrieveChunks(query: string, env: Env): Promise<Chunk[]> 
   });
 
   return results.matches
-    .filter((m) => m.score > 0.35)
+    .filter((m) => m.score > MIN_SCORE)
     .map((m) => ({
       source_file: String(m.metadata?.["source_file"] ?? "unknown"),
-      page_or_slide: m.metadata?.["page_or_slide"] as number | string ?? 0,
+      page_or_slide: (m.metadata?.["page_or_slide"] as number | string) ?? 0,
       course: String(m.metadata?.["course"] ?? ""),
       chunk_index: Number(m.metadata?.["chunk_index"] ?? 0),
       text: String(m.metadata?.["text"] ?? ""),

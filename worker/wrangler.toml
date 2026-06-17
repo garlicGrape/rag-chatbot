@@ -10,5 +10,6 @@ index_name = "msbai-index"
 [ai]
 binding = "AI"
 
-# ANTHROPIC_API_KEY is a secret — set via: wrangler secret put ANTHROPIC_API_KEY
-# Never put real keys here.
+# ANTHROPIC_API_KEY is a Wrangler secret — set via:
+#   wrangler secret put ANTHROPIC_API_KEY
+# Never put real keys in this file.

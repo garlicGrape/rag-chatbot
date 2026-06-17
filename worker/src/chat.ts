@@ -5,6 +5,7 @@ import { retrieveChunks } from "./retrieve";
 import { buildSystemPrompt, buildUserMessage } from "./prompt";
 
 const MAX_BODY_BYTES = 4_096;
+const MAX_QUESTION_CHARS = 500;
 const MODEL = "claude-haiku-4-5-20251001";
 
 export async function handleChat(
@@ -12,24 +13,19 @@ export async function handleChat(
   env: Env,
   cors: Record<string, string>
 ): Promise<Response> {
-  // Rate limiting
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const limit = checkRateLimit(ip);
   if (!limit.allowed) {
-    return new Response(
-      JSON.stringify({ error: "Rate limit exceeded" }),
-      {
-        status: 429,
-        headers: {
-          ...cors,
-          "Content-Type": "application/json",
-          "Retry-After": String(Math.ceil(limit.retryAfterMs / 1000)),
-        },
-      }
-    );
+    return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+      status: 429,
+      headers: {
+        ...cors,
+        "Content-Type": "application/json",
+        "Retry-After": String(Math.ceil(limit.retryAfterMs / 1000)),
+      },
+    });
   }
 
-  // Body size guard
   const contentLength = Number(request.headers.get("Content-Length") ?? 0);
   if (contentLength > MAX_BODY_BYTES) {
     return new Response(JSON.stringify({ error: "Request too large" }), {
@@ -59,12 +55,12 @@ export async function handleChat(
     });
   }
 
-  const question = ((body as Record<string, unknown>)["question"] as string).slice(0, 500);
+  const question = (
+    (body as Record<string, unknown>)["question"] as string
+  ).slice(0, MAX_QUESTION_CHARS);
 
-  // Retrieve relevant chunks
   const chunks = await retrieveChunks(question, env);
 
-  // Stream Claude response
   const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
   const stream = await client.messages.stream({
@@ -78,7 +74,7 @@ export async function handleChat(
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
 
-  // Send citations header as first SSE event
+  // First SSE event carries citations so the frontend can render them immediately
   const citations = chunks.map((c) => ({
     source_file: c.source_file,
     page_or_slide: c.page_or_slide,
@@ -86,7 +82,6 @@ export async function handleChat(
   }));
   writer.write(encoder.encode(`data: ${JSON.stringify({ citations })}\n\n`));
 
-  // Pipe Claude stream to SSE
   (async () => {
     try {
       for await (const event of stream) {
@@ -95,7 +90,9 @@ export async function handleChat(
           event.delta.type === "text_delta"
         ) {
           writer.write(
-            encoder.encode(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`)
+            encoder.encode(
+              `data: ${JSON.stringify({ text: event.delta.text })}\n\n`
+            )
           );
         }
       }

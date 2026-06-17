@@ -14,10 +14,11 @@ export function buildUserMessage(question: string, chunks: Chunk[]): string {
   }
 
   const context = chunks
-    .map(
-      (c, i) =>
-        `[${i + 1}] Source: ${c.source_file}, ${typeof c.page_or_slide === "number" ? "p." : "slide "}${c.page_or_slide} (${c.course})\n${c.text}`
-    )
+    .map((c, i) => {
+      const loc =
+        typeof c.page_or_slide === "number" ? `p.${c.page_or_slide}` : `slide ${c.page_or_slide}`;
+      return `[${i + 1}] Source: ${c.source_file}, ${loc} (${c.course})\n${c.text}`;
+    })
     .join("\n\n");
 
   return `Context excerpts from course materials:\n\n${context}\n\n---\nQuestion: ${question}`;
